@@ -1,27 +1,168 @@
-import { FormEvent, useState } from "react";
+import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { Card, ErrorMsg, Pill } from "../components";
 import { useFetch } from "../hooks";
 import { Case, ModelCfg, Run, Suite } from "../types";
 
+type CaseRow = Case & { scorer_config?: Record<string, unknown> };
+interface Draft { name: string; prompt: string; expected: string; scorer: string }
+
+const SCORERS = ["exact_match", "contains", "regex", "llm_judge"];
+const EMPTY: Draft = { name: "", prompt: "", expected: "", scorer: "contains" };
+const full = { width: "100%", minWidth: 0 } as const;
 const active = (runs: Run[]) => runs.some((r) => r.status === "queued" || r.status === "running");
+const autoName = (d: Draft) => d.name.trim() || d.prompt.trim().slice(0, 40);
+
+function DraftCells({ draft, onChange }: { draft: Draft; onChange: (d: Draft) => void }) {
+  return (
+    <>
+      <td>
+        <input style={full} placeholder="Name (optional)" value={draft.name}
+               onChange={(e) => onChange({ ...draft, name: e.target.value })} />
+      </td>
+      <td>
+        <textarea style={full} rows={2} placeholder="Input / prompt" value={draft.prompt}
+                  onChange={(e) => onChange({ ...draft, prompt: e.target.value })} />
+      </td>
+      <td>
+        <textarea style={full} rows={2} placeholder="Expected output" value={draft.expected}
+                  onChange={(e) => onChange({ ...draft, expected: e.target.value })} />
+      </td>
+      <td>
+        <select style={full} value={draft.scorer}
+                onChange={(e) => onChange({ ...draft, scorer: e.target.value })}>
+          {SCORERS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </td>
+    </>
+  );
+}
+
+function CasesTable(props: {
+  suiteId: string | undefined;
+  cases: CaseRow[] | null;
+  reload: () => void;
+  setError: (m: string | null) => void;
+}) {
+  const { suiteId, cases, reload, setError } = props;
+  const [draft, setDraft] = useState<Draft>(EMPTY);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [edit, setEdit] = useState<Draft>(EMPTY);
+
+  async function add() {
+    if (!draft.prompt.trim()) {
+      setError("Input (prompt) is required");
+      return;
+    }
+    setError(null);
+    try {
+      await api(`/suites/${suiteId}/cases`, "POST", {
+        name: autoName(draft),
+        prompt: draft.prompt,
+        expected_output: draft.expected || null,
+        scorer: draft.scorer,
+      });
+      setDraft(EMPTY);
+      reload();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  function startEdit(c: CaseRow) {
+    setEditId(c.id);
+    setEdit({ name: c.name, prompt: c.prompt, expected: c.expected_output ?? "", scorer: c.scorer });
+  }
+
+  async function save(c: CaseRow) {
+    if (!edit.prompt.trim()) {
+      setError("Input (prompt) is required");
+      return;
+    }
+    setError(null);
+    try {
+      await api(`/cases/${c.id}`, "PUT", {
+        name: autoName(edit),
+        prompt: edit.prompt,
+        expected_output: edit.expected || null,
+        scorer: edit.scorer,
+        scorer_config: c.scorer_config ?? {},
+        threshold: c.threshold,
+      });
+      setEditId(null);
+      reload();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function remove(c: CaseRow) {
+    if (!window.confirm(`Delete case "${c.name}"?`)) return;
+    setError(null);
+    try {
+      await api(`/cases/${c.id}`, "DELETE");
+      reload();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>Name</th><th>Input (prompt)</th><th>Expected output</th>
+            <th>Scorer</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {(cases ?? []).map((c, i) =>
+            editId === c.id ? (
+              <tr key={c.id}>
+                <td>{i + 1}</td>
+                <DraftCells draft={edit} onChange={setEdit} />
+                <td style={{ whiteSpace: "nowrap" }}>
+                  <button onClick={() => save(c)}>Save</button>{" "}
+                  <button className="link" onClick={() => setEditId(null)}>Cancel</button>
+                </td>
+              </tr>
+            ) : (
+              <tr key={c.id}>
+                <td>{i + 1}</td>
+                <td>{c.name}</td>
+                <td className="out">{c.prompt}</td>
+                <td className="out">{c.expected_output ?? "–"}</td>
+                <td><Pill kind="neutral">{c.scorer}</Pill></td>
+                <td style={{ whiteSpace: "nowrap" }}>
+                  <button className="link" onClick={() => startEdit(c)}>edit</button>{" "}
+                  <button className="link" onClick={() => remove(c)}>delete</button>
+                </td>
+              </tr>
+            ),
+          )}
+          <tr>
+            <td>+</td>
+            <DraftCells draft={draft} onChange={setDraft} />
+            <td><button onClick={add}>Add</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 export default function SuiteDetail() {
   const { suiteId } = useParams();
   const nav = useNavigate();
   const suite = useFetch<Suite>(`/suites/${suiteId}`);
-  const cases = useFetch<Case[]>(`/suites/${suiteId}/cases`);
+  const cases = useFetch<CaseRow[]>(`/suites/${suiteId}/cases`);
   const runs = useFetch<Run[]>(`/suites/${suiteId}/runs`, active);
   const models = useFetch<ModelCfg[]>(
     suite.data ? `/projects/${suite.data.project_id}/models` : null,
   );
 
-  const [name, setName] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [expected, setExpected] = useState("");
-  const [scorer, setScorer] = useState("contains");
-  const [threshold, setThreshold] = useState("1");
   const [modelId, setModelId] = useState("");
   const [base, setBase] = useState("");
   const [cand, setCand] = useState("");
@@ -29,25 +170,6 @@ export default function SuiteDetail() {
 
   const modelName = (id: string) => models.data?.find((m) => m.id === id)?.name ?? id.slice(0, 8);
   const done = (runs.data ?? []).filter((r) => r.status === "completed");
-
-  async function addCase(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    try {
-      await api(`/suites/${suiteId}/cases`, "POST", {
-        name, prompt, expected_output: expected || null, scorer, threshold: Number(threshold),
-      });
-      setName(""); setPrompt(""); setExpected("");
-      cases.reload();
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }
-
-  async function removeCase(id: string) {
-    await api(`/cases/${id}`, "DELETE");
-    cases.reload();
-  }
 
   async function startRun() {
     setError(null);
@@ -67,7 +189,12 @@ export default function SuiteDetail() {
         {suite.data && <Link to={`/projects/${suite.data.project_id}`}>← Project</Link>}
       </p>
       <h1>{suite.data?.name ?? "…"}</h1>
-      <ErrorMsg message={error ?? suite.error} />
+      <ErrorMsg message={error ?? suite.error ?? cases.error} />
+
+      <Card title="Test cases">
+        <p className="muted">Every change is saved to the database immediately.</p>
+        <CasesTable suiteId={suiteId} cases={cases.data} reload={cases.reload} setError={setError} />
+      </Card>
 
       <Card title="Run this suite">
         {models.data?.length === 0 && (
@@ -99,11 +226,19 @@ export default function SuiteDetail() {
             <div className="row">
               <select value={base} onChange={(e) => setBase(e.target.value)}>
                 <option value="">Baseline…</option>
-                {done.map((r) => <option key={r.id} value={r.id}>{modelName(r.model_id)} · {new Date(r.created_at).toLocaleTimeString()}</option>)}
+                {done.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {modelName(r.model_id)} · {new Date(r.created_at).toLocaleTimeString()}
+                  </option>
+                ))}
               </select>
               <select value={cand} onChange={(e) => setCand(e.target.value)}>
                 <option value="">Candidate…</option>
-                {done.map((r) => <option key={r.id} value={r.id}>{modelName(r.model_id)} · {new Date(r.created_at).toLocaleTimeString()}</option>)}
+                {done.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {modelName(r.model_id)} · {new Date(r.created_at).toLocaleTimeString()}
+                  </option>
+                ))}
               </select>
               <button disabled={!base || !cand}
                       onClick={() => nav(`/suites/${suiteId}/diff?baseline=${base}&candidate=${cand}`)}>
@@ -112,40 +247,6 @@ export default function SuiteDetail() {
             </div>
           </div>
         )}
-      </Card>
-
-      <Card title="Test cases">
-        <form onSubmit={addCase} className="stack">
-          <input placeholder="Case name" value={name} onChange={(e) => setName(e.target.value)} required />
-          <textarea rows={2} placeholder="Prompt sent to the model" value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)} required />
-          <input placeholder="Expected output (or regex pattern)" value={expected}
-                 onChange={(e) => setExpected(e.target.value)} />
-          <div className="row">
-            <select value={scorer} onChange={(e) => setScorer(e.target.value)}>
-              <option value="exact_match">exact_match</option>
-              <option value="contains">contains</option>
-              <option value="regex">regex</option>
-              <option value="llm_judge">llm_judge</option>
-            </select>
-            <label className="muted">pass threshold
-              <input type="number" min="0" max="1" step="0.1" value={threshold}
-                     onChange={(e) => setThreshold(e.target.value)} style={{ width: 70, marginLeft: 6 }} />
-            </label>
-            <button type="submit">Add case</button>
-          </div>
-        </form>
-        {cases.data?.map((c) => (
-          <div key={c.id} className="case">
-            <div className="row between">
-              <strong>{c.name}</strong>
-              <span><Pill kind="neutral">{c.scorer}</Pill>{" "}
-                <button className="link" onClick={() => removeCase(c.id)}>delete</button></span>
-            </div>
-            <div className="muted">{c.prompt}</div>
-            {c.expected_output && <div>expects: <code>{c.expected_output}</code></div>}
-          </div>
-        ))}
       </Card>
     </>
   );
